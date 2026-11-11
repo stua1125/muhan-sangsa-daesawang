@@ -1,0 +1,954 @@
+<!doctype html>
+<!-- PROTOTYPE - NOT FOR PRODUCTION -->
+<!-- Question: 걸어 다니며 방마다 대사를 맞히는 구조가 그냥 문제만 푸는 퀴즈보다 한 판을 끝까지 하고 싶게 만드는가 -->
+<!-- Date: 2026-11-11 -->
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>무한상사 대사왕</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { font-variant-numeric: tabular-nums; }
+  canvas { display: block; margin: 0 auto; }
+  #answer, #pname {
+    position: absolute; display: none; box-sizing: border-box; margin: 0; padding: 0 8px;
+    border: 2px solid #1a1c2c; border-radius: 0; outline: none; background: #fffbe8; color: #1a1c2c;
+    font-weight: 700; text-align: center;
+    font-family: "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", "NanumGothic", sans-serif;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<input id="pname" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="8" placeholder="이름 (8자까지)" aria-label="캐릭터 이름">
+<input id="answer" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="40" aria-label="빈칸에 들어갈 말">
+<script src="config.js"></script>
+<script src="questions.js"></script>
+<script>
+'use strict';
+// 무한상사 대사왕: 본사 복도를 걸어 회차별 방에 들어가, 상사들에게 말을 걸어 대사 빈칸을 맞힌다.
+// The starter's check hooks are kept: the fixed step, the clock hook, window.game, and the
+// play and figures scenes.
+
+// ---- Built to be checked ----------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const tune = new Proxy({}, { get: (_, k) => CONFIG[k].value }); // live: tune.speed is CONFIG.speed.value
+const STEP = 1 / 60;            // simulation step in seconds; motion is per second, never per frame
+const W = 480, H = 270;         // native pixel-art size, shown at a whole-number scale
+const PIXEL = true;             // whole-number scale, no smoothing
+const FONT = '"Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", "NanumGothic", sans-serif';
+const TITLE = '무한상사 대사왕';
+const CONTROLS = ['방향키 / WASD: 이동', 'Space: 말 걸기, 문 열기, 확인', '1~4: 보기 고르기 · 한글 입력 후 Enter', 'Esc: 일시정지 · M: 음소거'];
+const clock = window.GAME_CLOCK || { now: () => performance.now() / 1000 }; // a check may inject one
+const CHEAP = params.get('render') === 'cheap';
+let seed;
+function rng() { // mulberry32; every gameplay random call reads this, never Math.random
+  seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), seed | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+const events = []; // window.game.events: anything the game wants a run to see
+
+// ---- Screen ---------------------------------------------------------------------------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const answerEl = document.getElementById('answer');
+const nameEl = document.getElementById('pname');
+let SCALE = 1;
+function fit() { // whole-number scale for the pixels; text is drawn at the screen's own resolution
+  const k = Math.min(innerWidth / W, innerHeight / H);
+  const s = k >= 1 ? Math.floor(k) : k;
+  const r = s * (devicePixelRatio || 1);
+  canvas.width = Math.round(W * r); canvas.height = Math.round(H * r);
+  canvas.style.width = Math.round(W * s) + 'px'; canvas.style.height = Math.round(H * s) + 'px';
+  canvas.style.marginTop = Math.max(0, Math.floor((innerHeight - H * s) / 2)) + 'px';
+  canvas.style.imageRendering = 'pixelated';
+  ctx.setTransform(r, 0, 0, r, 0, 0); ctx.imageSmoothingEnabled = false;
+  SCALE = s; placeAnswer(); if (typeof naming !== 'undefined' && naming) placeBox(nameEl, NAME_BOX, 10);
+}
+function clear(c) { ctx.fillStyle = c; ctx.fillRect(0, 0, W, H); }
+function fontOf(size, bold) { return `${bold ? '700 ' : ''}${size}px ${FONT}`; }
+function text(s, x, y, size, c, align = 'center', bold = false) {
+  ctx.fillStyle = c; ctx.font = fontOf(size, bold); ctx.textAlign = align;
+  ctx.textBaseline = 'middle'; ctx.fillText(s, x, y);
+}
+function box(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); }
+function frameBox(x, y, w, h, fill, line = INK) { box(x, y, w, h, line); box(x + 1, y + 1, w - 2, h - 2, fill); }
+// Coloured text that wraps: segs is [[string, colour], ...]; returns lines of runs.
+function layout(segs, maxW, size, bold) {
+  ctx.font = fontOf(size, bold);
+  const lines = [[]]; let w = 0;
+  for (const [str, col] of segs) for (const ch of str) {
+    const cw = ctx.measureText(ch).width;
+    if (ch === '\n' || w + cw > maxW) { lines.push([]); w = 0; if (ch === '\n' || ch === ' ') continue; }
+    const line = lines[lines.length - 1], run = line[line.length - 1];
+    if (run && run.c === col) run.s += ch; else line.push({ s: ch, c: col });
+    w += cw;
+  }
+  return lines;
+}
+function drawLines(lines, x, y, size, bold, lh) {
+  ctx.font = fontOf(size, bold); ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  for (const line of lines) {
+    let cx = x;
+    for (const run of line) { ctx.fillStyle = run.c; ctx.fillText(run.s, cx, y); cx += ctx.measureText(run.s).width; }
+    y += lh;
+  }
+  return y;
+}
+
+// ---- Input: keys by position (event.code), OS key repeat ignored ------------------------
+const down = new Set(), hit = new Set();
+const pressed = code => hit.has(code); // true for one step after the key goes down
+let typing = false, typedSubmit = null, submitAfterCompose = false;
+addEventListener('keydown', e => {
+  startAudio();
+  if (typing && e.target === answerEl) { // the answer box owns the keyboard while it is open
+    if (e.code === 'Escape') hit.add('Escape');
+    return;
+  }
+  if (e.target === nameEl) { // the name box: only leaving it reaches the game
+    const composing = e.isComposing || e.keyCode === 229;
+    if (e.code === 'ArrowDown' || e.code === 'Tab' || (e.key === 'Enter' && !composing)) { e.preventDefault(); if (!e.repeat) hit.add('ArrowDown'); }
+    return;
+  }
+  if (!e.repeat) { down.add(e.code); hit.add(e.code); }
+  if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+});
+addEventListener('keyup', e => down.delete(e.code));
+addEventListener('pointerdown', () => { startAudio(); if (typing) answerEl.focus(); });
+nameEl.addEventListener('input', () => { if (state && state.cc) { state.cc.char.name = nameEl.value.trim(); } });
+addEventListener('blur', () => down.clear());
+answerEl.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  if (e.isComposing || e.keyCode === 229) { submitAfterCompose = true; return; } // a Hangul syllable is still being composed
+  typedSubmit = answerEl.value;
+});
+answerEl.addEventListener('compositionend', () => {
+  if (submitAfterCompose) { submitAfterCompose = false; typedSubmit = answerEl.value; }
+});
+const ANSWER_BOX = { x: 130, y: 178, w: 220, h: 22 };
+function placeAnswer() {
+  const r = canvas.getBoundingClientRect();
+  answerEl.style.left = Math.round(r.left + ANSWER_BOX.x * SCALE) + 'px';
+  answerEl.style.top = Math.round(r.top + ANSWER_BOX.y * SCALE) + 'px';
+  answerEl.style.width = Math.round(ANSWER_BOX.w * SCALE) + 'px';
+  answerEl.style.height = Math.round(ANSWER_BOX.h * SCALE) + 'px';
+  answerEl.style.fontSize = Math.round(12 * SCALE) + 'px';
+}
+const NAME_BOX = { x: 262, y: 37, w: 150, h: 13 };
+function placeBox(el, b, size) {
+  const r = canvas.getBoundingClientRect();
+  el.style.left = Math.round(r.left + b.x * SCALE) + 'px'; el.style.top = Math.round(r.top + b.y * SCALE) + 'px';
+  el.style.width = Math.round(b.w * SCALE) + 'px'; el.style.height = Math.round(b.h * SCALE) + 'px';
+  el.style.fontSize = Math.round(size * SCALE) + 'px';
+}
+let naming = false;
+function syncName() { // the name box shows on the character screen, and has the keyboard on its row
+  const want = scene === 'create';
+  if (want !== naming) { naming = want; nameEl.style.display = want ? 'block' : 'none'; if (want) { placeBox(nameEl, NAME_BOX, 10); nameEl.value = state.cc.char.name; } }
+  if (!want) return;
+  const on = state.cc.row === 0;
+  if (on && document.activeElement !== nameEl) { nameEl.focus(); down.clear(); }
+  if (!on && document.activeElement === nameEl) nameEl.blur();
+}
+function syncAnswer() { // the box shows only while a typed question is open
+  const want = scene === 'play' && state.mode === 'quiz' && state.q.typed;
+  if (want === typing) return;
+  typing = want;
+  answerEl.style.display = want ? 'block' : 'none';
+  if (want) { placeAnswer(); answerEl.focus(); down.clear(); } else answerEl.blur();
+}
+
+// ---- Audio: started on first input, mute on M --------------------------------------------
+let audio = null, muted = false;
+function startAudio() {
+  if (!audio) {
+    const ac = window.GAME_AUDIO || new (window.AudioContext || window.webkitAudioContext)(); // a check may inject one
+    const out = ac.createGain(); out.gain.value = muted ? 0 : tune.volume;
+    out.connect(ac.destination); audio = { ac, out };
+  }
+  if (audio.ac.state === 'suspended') audio.ac.resume();
+}
+function setMuted(m) { muted = m; if (audio) audio.out.gain.value = m ? 0 : tune.volume; }
+addEventListener('tune', () => setMuted(muted));
+function tone(freq, dur, type = 'square', vol = 0.3, delay = 0) {
+  if (!audio || muted) return;
+  const t = audio.ac.currentTime + delay, o = audio.ac.createOscillator(), g = audio.ac.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(audio.out); o.start(t); o.stop(t + dur);
+}
+const sfx = {
+  right() { tone(660, 0.1); tone(990, 0.2, 'square', 0.3, 0.1); },
+  wrong() { tone(170, 0.35, 'sawtooth', 0.35); tone(120, 0.35, 'sawtooth', 0.3, 0.12); },
+  door() { tone(196, 0.08, 'triangle', 0.4); tone(294, 0.14, 'triangle', 0.4, 0.08); },
+  talk() { tone(520, 0.05, 'square', 0.2); tone(700, 0.05, 'square', 0.2, 0.05); },
+  move() { tone(440, 0.03, 'square', 0.12); },
+  tick() { tone(1200, 0.03, 'square', 0.12); },
+  locked() { tone(140, 0.12, 'square', 0.25); },
+  clear() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.18, 'square', 0.3, i * 0.12)); },
+  fail() { [330, 277, 220].forEach((f, i) => tone(f, 0.22, 'triangle', 0.35, i * 0.16)); },
+};
+
+// ---- Pixel art: everything is drawn in code, one pixel density --------------------------
+const INK = '#1a1c2c', PAPER = '#fffbe8', NAVY = '#2b3a67', GOLD = '#e0a93a', RED = '#c8343a', GREEN = '#2f9a4a', ORANGE = '#f08a24';
+const T = 16, COLS = 30, ROWS = 16, HUD = 14;
+function sheet(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+function hash(x, y) { let h = (x * 73856093) ^ (y * 19349663); h = Math.imul(h ^ (h >>> 13), 0x5bd1e995); return (h ^ (h >>> 15)) >>> 0; }
+
+// The cast. Each has its own outline: head and body width, height and hair shape differ.
+const CHARS = {
+  player: { name: '신입사원', w: 6, hair: 'part', hc: '#7a4a24', suit: '#eef3fb', shirt: '#eef3fb', tie: ORANGE, short: 2, lanyard: true },
+  yu:     { name: '유부장', w: 6, hair: 'neat', hc: '#1b1b22', suit: '#27407a', tie: '#c8343a', glasses: true, short: 0 },
+  park:   { name: '박차장', w: 8, hair: 'thin', hc: '#1b1b22', suit: '#6b6f7a', tie: '#2f9a4a', brows: true, short: 2 },
+  junha:  { name: '정과장', w: 12, headW: 10, hair: 'neat', hc: '#2a211c', suit: '#7a5230', tie: '#e0c040', short: 0 },
+  don:    { name: '정대리', w: 10, hair: 'part', hc: '#1b1b22', suit: '#3f6b52', tie: '#b05ad0', short: 3 },
+  noh:    { name: '노사원', w: 6, hair: 'spiky', hc: '#f0d050', suit: '#6a3fa0', tie: '#ff7ab0', goatee: true, short: 1 },
+  haha:   { name: '하사원', w: 6, hair: 'bowl', hc: '#3a2a1c', suit: '#b23a48', tie: '#ffffff', short: 5 },
+  gil:    { name: '길사원', w: 10, headW: 10, hair: 'bald', hc: '#2a211c', suit: '#2c2c34', tie: '#8a8a94', beard: true, short: 1 },
+  gd:     { name: '권지용 사원', w: 6, hair: 'mohawk', hc: '#e8502a', suit: '#1e1e26', tie: '#ffffff', short: 3 },
+  kwang:  { name: '황광희 사원', w: 6, hair: 'curly', hc: '#6a4a2a', suit: '#3a8fb0', tie: '#f0d050', short: 2 },
+  guest:  { name: '손님', w: 8, hair: 'long', hc: '#2a211c', suit: '#2f8f8f', tie: '#ffffff', short: 2 },
+  boss:   { name: '사장님', w: 10, hair: 'cap', hc: '#d8d8e0', suit: '#3a2a4a', tie: GOLD, short: 1 },
+};
+const PGW = 18, PGH = 30;
+function makePerson(sp, frame) {
+  const g = Array.from({ length: PGH }, () => Array(PGW).fill(null));
+  const put = (x, y, w, h, c) => { for (let j = y; j < y + h; j++) for (let i = x; i < x + w; i++) if (j >= 0 && j < PGH && i >= 0 && i < PGW) g[j][i] = c; };
+  const cx = 9, hw = sp.headW || 8, bw = sp.w, top = 3 + (sp.short || 0), x0 = cx - hw / 2;
+  const skin = sp.skin || '#f2c79a', shade = sp.shade || '#d9a878', hc = sp.hc, dark = '#22242e';
+  put(x0, top, hw, 8, skin); put(x0, top + 7, hw, 1, shade);
+  switch (sp.hair) {
+    case 'neat': put(x0, top - 1, hw, 3, hc); put(x0, top + 2, 1, 2, hc); put(x0 + hw - 1, top + 2, 1, 2, hc); break;
+    case 'part': put(x0, top - 1, hw, 3, hc); put(x0, top + 2, 3, 1, hc); put(x0 + hw - 1, top + 2, 1, 3, hc); break;
+    case 'thin': put(x0, top, 2, 4, hc); put(x0 + hw - 2, top, 2, 4, hc); put(x0 + 1, top - 1, 2, 1, hc); put(x0 + hw - 3, top - 1, 2, 1, hc); put(cx - 1, top, 1, 1, '#fff4dc'); break;
+    case 'spiky': put(x0, top - 1, hw, 2, hc); for (let i = 0; i < hw; i += 2) put(x0 + i, top - 3, 1, 2, hc); break;
+    case 'bald': put(x0 + 1, top - 1, hw - 2, 1, skin); put(x0 + 2, top, 2, 1, '#fff4dc'); break;
+    case 'bowl': put(x0 - 1, top - 2, hw + 2, 4, hc); put(x0, top + 2, hw, 1, hc); break;
+    case 'curly': put(x0 - 1, top - 2, hw + 2, 4, hc); for (let i = -1; i <= hw; i += 2) put(x0 + i, top - 3, 1, 1, hc); put(x0 - 1, top + 2, 1, 2, hc); put(x0 + hw, top + 2, 1, 2, hc); break;
+    case 'bob': put(x0 - 1, top - 1, hw + 2, 3, hc); put(x0 - 1, top + 2, 2, 5, hc); put(x0 + hw - 1, top + 2, 2, 5, hc); put(x0 + 1, top + 2, hw - 2, 1, hc); break;
+    case 'pony': put(x0, top - 1, hw, 3, hc); put(x0, top + 2, 1, 2, hc); put(x0 + hw, top, 2, 3, hc); put(x0 + hw + 1, top + 3, 1, 5, hc); break;
+    case 'bun': put(x0, top - 1, hw, 3, hc); put(cx - 2, top - 3, 4, 2, hc); put(x0, top + 2, 1, 2, hc); put(x0 + hw - 1, top + 2, 1, 2, hc); break;
+    case 'long': put(x0 - 1, top - 1, hw + 2, 3, hc); put(x0 - 1, top + 2, 2, 8, hc); put(x0 + hw - 1, top + 2, 2, 8, hc); break;
+    case 'mohawk': put(cx - 1, top - 4, 2, 5, hc); put(x0, top, hw, 1, '#3a3a44'); break;
+    case 'cap': put(x0 - 1, top - 2, hw + 2, 3, hc); put(x0 - 1, top + 1, hw + 4, 1, hc); break;
+  }
+  const ey = top + 4;
+  if (sp.glasses) {
+    put(cx - 3, ey - 1, 2, 2, '#ffffff'); put(cx + 1, ey - 1, 2, 2, '#ffffff'); put(cx - 1, ey - 1, 2, 1, dark);
+    put(cx - 2, ey, 1, 1, dark); put(cx + 1, ey, 1, 1, dark); put(x0, ey - 1, 1, 1, dark); put(x0 + hw - 1, ey - 1, 1, 1, dark);
+  } else { put(cx - 2, ey, 1, 1, dark); put(cx + 1, ey, 1, 1, dark); }
+  if (sp.brows) { put(cx - 3, ey - 2, 2, 1, dark); put(cx + 1, ey - 2, 2, 1, dark); }
+  if (sp.beard) { put(x0, top + 5, hw, 3, hc); put(cx - 1, top + 6, 2, 1, '#b5523f'); }
+  else { put(cx - 1, top + 6, 2, 1, '#b5523f'); if (sp.goatee) put(cx - 1, top + 7, 2, 2, hc); }
+  const by = top + 8 + (sp.goatee ? 1 : 0);
+  put(cx - bw / 2, by, bw, 8, sp.suit);
+  put(cx - bw / 2 - 1, by + 1, 1, 6, sp.suit); put(cx + bw / 2, by + 1, 1, 6, sp.suit);         // arms
+  const sleeve = sp.arms === 'short' ? 2 : sp.arms === 'rolled' ? 4 : 5;                          // how far the sleeve comes down
+  put(cx - bw / 2 - 1, by + 1 + sleeve, 1, 6 - sleeve, skin); put(cx + bw / 2, by + 1 + sleeve, 1, 6 - sleeve, skin); // forearms and hands
+  put(cx - 2, by, 4, 2, sp.shirt || '#ffffff'); put(cx - 1, by + 2, 2, 1, sp.shirt || '#ffffff');
+  put(cx - 1, by + 1, 2, 3, sp.tie); put(cx - 1, by + 4, 1, 1, sp.tie);
+  if (sp.lanyard) { put(cx + 1, by + 3, 2, 3, '#3a8fd8'); put(cx + 1, by + 4, 2, 1, '#ffffff'); }
+  const ly = by + 8, lw = bw >= 10 ? 3 : 2, pants = sp.pants || '#2a2c3a';
+  const lift = [0, 0]; if (frame === 1) lift[0] = 1; if (frame === 2) lift[1] = 1;
+  const shoe = sp.shoes || dark, bare = sp.legs === 'shorts' || sp.legs === 'skirt';
+  [[cx - 1 - lw, lift[0]], [cx + 1, lift[1]]].forEach(([lx, up]) => {
+    put(lx, ly, lw, 3 - up, bare ? skin : pants);
+    if (sp.legs === 'shorts') put(lx, ly, lw, 1, pants);
+    put(lx, ly + 3 - up, lw, 1, shoe);
+  });
+  if (sp.legs === 'skirt') { put(cx - bw / 2, ly - 1, bw, 2, pants); put(cx - bw / 2 - 1, ly, bw + 2, 1, pants); }
+  const c = sheet(PGW, PGH), x = c.getContext('2d');
+  for (let j = 0; j < PGH; j++) for (let i = 0; i < PGW; i++) {
+    let col = g[j][i];
+    if (!col && ((g[j - 1] && g[j - 1][i]) || (g[j + 1] && g[j + 1][i]) || g[j][i - 1] || g[j][i + 1])) col = INK; // one outline rule
+    if (col) { x.fillStyle = col; x.fillRect(i, j, 1, 1); }
+  }
+  c.foot = ly + 4;
+  return c;
+}
+const SPR = {};
+for (const k in CHARS) SPR[k] = [0, 1, 2].map(f => makePerson(CHARS[k], f));
+function drawPerson(who, x, y, frame = 0) {
+  const s = (SPR[who] || SPR.guest)[frame];
+  ctx.fillStyle = 'rgba(10,12,30,0.28)'; ctx.fillRect(Math.round(x) - 6, Math.round(y) - 1, 12, 2);
+  ctx.drawImage(s, Math.round(x) - 9, Math.round(y) - s.foot);
+}
+
+// The player's own character: parts picked one by one, like bricks.
+const HAIR_M = [['part', '가르마'], ['neat', '단정한 머리'], ['spiky', '뾰족 머리'], ['bowl', '바가지 머리'], ['curly', '곱슬머리'], ['thin', '넓은 이마'], ['mohawk', '모히칸'], ['bald', '민머리']];
+const HAIR_F = [['long', '긴 머리'], ['bob', '단발'], ['pony', '포니테일'], ['bun', '올림머리'], ['bowl', '바가지 머리'], ['curly', '곱슬머리']];
+const C_HAIR = ['#7a4a24', '#1b1b22', '#3a2a1c', '#f0d050', '#e8502a', '#d8d8e0', '#b05ad0', '#3a8fd8'];
+const C_SKIN = [['#f2c79a', '#d9a878'], ['#ffe0c4', '#e8bfa0'], ['#d9a070', '#b98050'], ['#a8703e', '#885428']];
+const C_TOP = ['#eef3fb', '#27407a', '#6b6f7a', '#7a5230', '#3f6b52', '#6a3fa0', '#b23a48', '#2c2c34', '#ffd860', '#ff9ac0'];
+const C_BOTTOM = ['#2a2c3a', '#27407a', '#7a5230', '#6b6f7a', '#b23a48', '#e8e0c8', '#3f6b52'];
+const C_SHOES = ['#22242e', '#7a4e2a', '#ffffff', '#c8343a', '#f0d050', '#3a8fd8'];
+const CC_ROWS = [
+  { k: 'name', label: '이름' },
+  { k: 'gender', label: '성별', opts: [['m', '남자'], ['f', '여자']] },
+  { k: 'hair', label: '머리 모양', opts: c => (c.gender === 'f' ? HAIR_F : HAIR_M) },
+  { k: 'hc', label: '머리 색', colors: C_HAIR },
+  { k: 'face', label: '얼굴형', opts: [[8, '보통'], [10, '넓적한 얼굴'], [6, '갸름한 얼굴']] },
+  { k: 'skin', label: '피부색', colors: C_SKIN.map(v => v[0]) },
+  { k: 'body', label: '몸통', opts: [[6, '날씬한 몸'], [8, '보통 몸'], [10, '듬직한 몸']] },
+  { k: 'suit', label: '상의 색', colors: C_TOP },
+  { k: 'arms', label: '팔', opts: [['long', '긴소매'], ['rolled', '걷은 소매'], ['short', '반소매']] },
+  { k: 'legs', label: '다리', opts: [['pants', '긴바지'], ['shorts', '반바지'], ['skirt', '치마']] },
+  { k: 'pants', label: '하의 색', colors: C_BOTTOM },
+  { k: 'shoes', label: '신발', colors: C_SHOES },
+  { k: 'go', label: '입장하기' },
+];
+const DEFAULT_CHAR = { name: '', gender: 'm', hair: 'part', hc: '#7a4a24', face: 8, skin: '#f2c79a', body: 6, suit: '#eef3fb', arms: 'long', legs: 'pants', pants: '#2a2c3a', shoes: '#22242e' };
+const rowOpts = (row, c) => row.colors ? row.colors.map(v => [v, '']) : typeof row.opts === 'function' ? row.opts(c) : row.opts;
+function charSpec(c) {
+  const sk = C_SKIN.find(v => v[0] === c.skin) || C_SKIN[0];
+  return { name: c.name || '신입사원', w: c.body, headW: c.face, hair: c.hair, hc: c.hc, skin: sk[0], shade: sk[1], suit: c.suit, shirt: '#ffffff', tie: ORANGE, short: 2, lanyard: true, arms: c.arms, legs: c.legs, pants: c.pants, shoes: c.shoes };
+}
+function applyChar(c) { CHARS.player = charSpec(c); SPR.player = [0, 1, 2].map(f => makePerson(CHARS.player, f)); }
+
+// Tiles. Floors and walls change with the room's theme; props sit on the floor.
+function drawFloor(g, kind, P, cx, cy) {
+  const x = cx * T, y = cy * T, h = hash(cx, cy);
+  const R = (c, a, b, w, hh) => { g.fillStyle = c; g.fillRect(x + a, y + b, w, hh); };
+  R(P.fa, 0, 0, T, T);
+  if (kind === 'carpet') { for (let i = 0; i < 4; i++) R(P.fb, (h >> (i * 4)) & 15, (h >> (i * 4 + 2)) & 15, 1, 1); if ((cx + cy) % 2) R(P.fb, 0, 15, 16, 1); }
+  else if (kind === 'grass') { for (let i = 0; i < 3; i++) R(P.fb, ((h >> (i * 5)) & 13) + 1, ((h >> (i * 5 + 3)) & 13), 1, 2); if (h % 6 === 0) { R('#ffffff', 5, 6, 2, 2); R('#f0d050', 5, 6, 1, 1); } if (h % 9 === 0) R('#f08ab0', 11, 10, 2, 2); }
+  else if (kind === 'wood') { R(P.fb, 0, 7, 16, 1); R(P.fb, 0, 15, 16, 1); R(P.fb, h % 12 + 1, 0, 1, 7); R(P.fb, (h >> 4) % 12 + 1, 8, 1, 7); }
+  else if (kind === 'dark') { R(P.fb, 15, 0, 1, 16); R(P.fb, 0, 15, 16, 1); if (h % 5 === 0) R('#3a4470', 3, 3, 2, 1); }
+  else if (kind === 'marble') { R(P.fb, 0, 15, 16, 1); R(P.fb, 15, 0, 1, 16); for (let i = 0; i < 4; i++) R(P.fb, 3 + i * 2 + (h % 3), 3 + i * 2, 2, 1); }
+  else if (kind === 'sand') { for (let i = 0; i < 5; i++) R(P.fb, (h >> (i * 3)) & 15, (h >> (i * 3 + 2)) & 15, 2, 1); }
+}
+function drawWall(g, kind, P, cx, cy) {
+  const x = cx * T, y = cy * T, h = hash(cx, cy);
+  const R = (c, a, b, w, hh) => { g.fillStyle = c; g.fillRect(x + a, y + b, w, hh); };
+  R(P.wt, 0, 0, T, T);
+  if (kind === 'office') { R(P.wf, 0, 10, 16, 6); R(P.trim, 0, 14, 16, 2); }
+  else if (kind === 'hedge') { for (let i = 0; i < 6; i++) R(P.wf, (h >> (i * 4)) & 12, (h >> (i * 4 + 2)) & 12, 4, 3); R('#1c4a24', 0, 15, 16, 1); if (h % 4 === 0) R('#f0d050', 6, 5, 2, 2); }
+  else if (kind === 'curtain') { for (let i = 0; i < 16; i += 4) R(P.wf, i + 2, 0, 2, 16); R(GOLD, 0, 0, 16, 2); R('#5a1018', 0, 15, 16, 1); }
+  else if (kind === 'night') { R(P.wf, 0, 11, 16, 5); R('#0d1020', 0, 14, 16, 2); }
+  else if (kind === 'brick') { for (let j = 0; j < 16; j += 4) { R(P.wf, 0, j + 3, 16, 1); R(P.wf, (j % 8 ? 4 : 12), j, 1, 3); } }
+  else if (kind === 'tent') { for (let i = 0; i < 16; i += 8) R(P.wf, i, 0, 4, 16); R('#ffffff', 0, 13, 16, 1); R(P.trim, 0, 14, 16, 2); }
+}
+function drawProp(g, ch, cx, cy) {
+  const x = cx * T, y = cy * T;
+  const R = (c, a, b, w, hh) => { g.fillStyle = c; g.fillRect(x + a, y + b, w, hh); };
+  const O = (a, b, w, hh) => R(INK, a - 1, b - 1, w + 2, hh + 2); // outline behind a block
+  switch (ch) {
+    case 'd': O(1, 3, 14, 11); R('#b07a44', 1, 3, 14, 9); R('#6e4726', 1, 12, 14, 2); R(INK, 4, 0, 8, 7); R('#8fd3ff', 5, 1, 6, 4); R('#dff4ff', 5, 1, 2, 1); R('#ffffff', 2, 8, 4, 3); R('#c9c9c9', 9, 9, 5, 2); break;
+    case 'p': O(5, 10, 6, 5); R('#b5613c', 5, 10, 6, 5); R('#8e4526', 5, 14, 6, 1); O(4, 3, 8, 7); R('#3f9b4b', 4, 3, 8, 7); R('#3f9b4b', 6, 1, 4, 2); R('#6cc66a', 5, 4, 2, 2); R('#6cc66a', 9, 6, 2, 2); R('#256b33', 7, 7, 2, 3); break;
+    case 'f': O(2, 1, 12, 14); R('#8d97a8', 2, 1, 12, 14); R('#6c7586', 2, 5, 12, 1); R('#6c7586', 2, 10, 12, 1); R('#e8e8ee', 7, 3, 2, 1); R('#e8e8ee', 7, 7, 2, 1); R('#e8e8ee', 7, 12, 2, 1); break;
+    case 'w': O(5, 1, 6, 6); R('#9fd8ff', 5, 1, 6, 6); R('#dff4ff', 6, 2, 1, 3); O(4, 7, 8, 8); R('#e8e8ee', 4, 7, 8, 8); R('#c0c0cc', 4, 13, 8, 2); R(RED, 6, 9, 1, 2); R('#3a8fd8', 9, 9, 1, 2); break;
+    case 'k': O(1, 4, 14, 11); R('#d7d7dd', 1, 6, 14, 9); R('#9aa0ad', 1, 4, 14, 3); R('#ffffff', 4, 2, 8, 3); R('#6c7586', 3, 10, 10, 1); R(GREEN, 12, 8, 1, 1); break;
+    case 't': O(7, 10, 3, 6); R('#7a4e2a', 7, 10, 3, 6); O(2, 2, 12, 9); R('#2f7d3a', 2, 2, 12, 9); R('#2f7d3a', 4, 0, 8, 2); R('#4fa64f', 4, 2, 4, 3); R('#4fa64f', 9, 5, 3, 2); R('#1f5a2a', 3, 9, 10, 2); break;
+    case 'r': O(3, 7, 10, 7); R('#8a8f9c', 3, 7, 10, 7); R('#8a8f9c', 5, 5, 6, 2); R('#b4b9c6', 5, 6, 3, 2); R('#6a6f7c', 4, 12, 9, 2); break;
+    case 'm': for (let j = 0; j < 16; j += 4) for (let i = 0; i < 16; i += 4) R(((i + j) / 4) % 2 ? '#e24a52' : '#ffffff', i, j, 4, 4); break;
+    case 'g': O(2, 4, 12, 10); R('#6a5240', 2, 4, 12, 10); R('#22242e', 4, 6, 8, 6); R('#c0503a', 5, 7, 2, 2); R('#c0503a', 9, 9, 2, 2); R('#e88a4a', 8, 7, 2, 1); R('#4a3628', 2, 13, 12, 1); break;
+    case 's': g.fillStyle = 'rgba(255,236,150,0.45)'; g.fillRect(x + 2, y + 5, 12, 7); g.fillRect(x + 4, y + 3, 8, 11); g.fillStyle = 'rgba(255,250,210,0.5)'; g.fillRect(x + 5, y + 6, 6, 5); break;
+    case 'S': O(3, 1, 10, 14); R('#22242e', 3, 1, 10, 14); R('#5a5e6c', 5, 3, 6, 4); R('#8a8f9c', 7, 4, 2, 2); R('#5a5e6c', 5, 9, 6, 5); R('#8a8f9c', 7, 11, 2, 2); break;
+    case 'b': O(1, 6, 14, 6); R('#b07a44', 1, 6, 14, 4); R('#8a5a30', 1, 10, 14, 2); R('#6e4726', 2, 12, 2, 3); R('#6e4726', 12, 12, 2, 3); break;
+    case 'T': O(2, 3, 12, 10); R('#f4f1e6', 2, 3, 12, 10); R('#d8d4c4', 2, 11, 12, 2); R('#3a8fd8', 5, 5, 2, 3); R('#e0c040', 9, 6, 3, 2); R('#6e4726', 7, 13, 2, 3); break;
+    case 'x': O(2, 6, 12, 9); R('#c49a5a', 2, 6, 12, 9); R('#a07a40', 2, 10, 12, 1); R('#e8dcc0', 7, 6, 2, 9); O(5, 1, 8, 5); R('#c49a5a', 5, 1, 8, 5); R('#e8dcc0', 8, 1, 2, 5); break;
+    case 'l': g.fillStyle = 'rgba(255,220,120,0.22)'; g.fillRect(x - 6, y - 4, 28, 22); O(7, 6, 2, 8); R('#8a8f9c', 7, 6, 2, 8); O(4, 1, 8, 5); R('#ffd860', 4, 1, 8, 5); R('#fff4c0', 5, 2, 6, 2); R('#5a5e6c', 5, 14, 6, 1); break;
+    case 'n': O(0, 3, 16, 12); R('#4a6fb5', 0, 3, 16, 12); R('#7a9be0', 0, 3, 16, 2); R('#35508a', 0, 13, 16, 2); R('#35508a', 7, 3, 2, 12); break;
+    case 'e': O(1, 4, 14, 11); R('#e8e0c8', 1, 8, 14, 7); R('#3a8fd8', 1, 4, 14, 4); R('#ffffff', 5, 4, 2, 4); R('#ffffff', 10, 4, 2, 4); R('#22242e', 6, 10, 4, 5); break;
+    case 'o': O(3, 3, 10, 10); R('#e06a2a', 3, 3, 10, 10); R('#22242e', 3, 6, 10, 1); R('#22242e', 7, 3, 1, 10); R('#f09a5a', 4, 4, 2, 2); break;
+    case 'u': O(4, 9, 8, 6); R('#8a5a30', 4, 9, 8, 6); R(GOLD, 6, 2, 4, 5); R(GOLD, 5, 3, 6, 2); R('#fff0a0', 7, 3, 1, 2); R(GOLD, 7, 7, 2, 2); break;
+    case 'v': O(1, 2, 14, 13); R('#e8e8ee', 1, 2, 14, 13); R('#c8343a', 2, 3, 12, 3); R('#22242e', 3, 8, 3, 5); R('#22242e', 7, 8, 3, 5); R('#22242e', 11, 8, 2, 5); R('#f0d050', 4, 9, 1, 1); R('#3a8fd8', 8, 9, 1, 1); break;
+  }
+}
+function drawDeco(g, ch, cx, cy, P) { // on a wall tile
+  const x = cx * T, y = cy * T;
+  const R = (c, a, b, w, hh) => { g.fillStyle = c; g.fillRect(x + a, y + b, w, hh); };
+  switch (ch) {
+    case 'P': R(INK, 1, 1, 14, 11); R(GOLD, 2, 2, 12, 9); R(PAPER, 3, 3, 10, 7); R(NAVY, 5, 5, 6, 1); R(NAVY, 4, 7, 8, 1); break;
+    case 'W': R(INK, 1, 1, 14, 11); R(P.sky || '#9fd8ff', 2, 2, 12, 9); R('#ffffff', 3, 3, 4, 2); R(INK, 7, 2, 1, 9); if (P.sky) { R('#f0d050', 4, 5, 1, 1); R('#f0d050', 10, 4, 1, 1); R('#f0d050', 11, 8, 1, 1); R('#8fd3ff', 5, 9, 1, 1); } break;
+    case 'h': R(INK, 0, 1, 16, 11); R('#ffffff', 1, 2, 14, 9); R(RED, 3, 4, 6, 1); R(NAVY, 3, 6, 9, 1); R(GREEN, 3, 8, 4, 1); break;
+    case 'c': R(INK, 4, 1, 8, 8); R('#ffffff', 5, 2, 6, 6); R(INK, 8, 3, 1, 3); R(RED, 8, 5, 2, 1); break;
+    case 'N': R(INK, 1, 2, 14, 8); R('#22242e', 2, 3, 12, 6); R('#ff5ab0', 3, 4, 3, 1); R('#5af0d0', 7, 4, 4, 1); R('#f0d050', 4, 6, 6, 1); break;
+  }
+}
+function drawDoor(g, x, y, col) { // a door fills one tile
+  const R = (c, a, b, w, hh) => { g.fillStyle = c; g.fillRect(x + a, y + b, w, hh); };
+  R(INK, 1, 0, 14, 16); R(col, 2, 1, 12, 15); R('rgba(255,255,255,0.25)', 3, 2, 10, 1); R('rgba(0,0,0,0.2)', 3, 8, 10, 1); R(GOLD, 11, 9, 2, 2);
+}
+
+// ---- Rooms: one theme per episode, each with its own palette, floor, walls and props ------
+// props: [char, col, row]; deco: wall pieces on rows 0-1; spots: where the bosses stand.
+const THEMES = {
+  office: { label: '사무실', floor: 'carpet', wall: 'office', P: { fa: '#b9b4a6', fb: '#a8a393', wt: '#ece4cc', wf: '#d2c9aa', trim: NAVY },
+    props: [['d', 3, 4], ['d', 4, 4], ['d', 3, 6], ['d', 4, 6], ['n', 2, 4], ['n', 2, 6], ['d', 9, 4], ['d', 10, 4], ['d', 9, 6], ['d', 10, 6], ['d', 19, 4], ['d', 20, 4], ['d', 19, 6], ['d', 20, 6], ['n', 21, 4], ['n', 21, 6], ['d', 25, 4], ['d', 26, 4],
+      ['p', 1, 2], ['p', 28, 2], ['f', 13, 2], ['f', 14, 2], ['f', 15, 2], ['w', 17, 2], ['k', 27, 10], ['x', 1, 12], ['p', 1, 14], ['p', 28, 14], ['d', 6, 11], ['d', 7, 11], ['d', 22, 11], ['d', 23, 11]],
+    deco: [['P', 14, 0], ['P', 15, 0], ['W', 4, 0], ['W', 5, 0], ['W', 24, 0], ['W', 25, 0], ['c', 9, 0], ['h', 20, 0]],
+    spots: [[6, 5], [12, 5], [18, 9], [23, 5], [8, 9], [26, 8], [14, 7], [4, 12]] },
+  picnic: { label: '야유회장', floor: 'grass', wall: 'hedge', P: { fa: '#74b452', fb: '#5c9a40', wt: '#3a8040', wf: '#2a6a32', trim: '#1c4a24' },
+    props: [['t', 2, 3], ['t', 5, 2], ['t', 26, 3], ['t', 23, 2], ['t', 1, 10], ['t', 28, 11], ['t', 12, 2], ['m', 8, 6], ['m', 9, 6], ['m', 8, 7], ['m', 9, 7], ['m', 10, 6], ['m', 10, 7], ['o', 11, 9],
+      ['m', 19, 9], ['m', 20, 9], ['m', 19, 10], ['m', 20, 10], ['m', 21, 9], ['m', 21, 10], ['r', 15, 4], ['r', 4, 12], ['r', 25, 7], ['e', 17, 2], ['e', 18, 2], ['x', 20, 3], ['b', 6, 13], ['b', 23, 13], ['u', 14, 11]],
+    deco: [],
+    spots: [[7, 9], [12, 6], [18, 6], [22, 12], [4, 6], [25, 10], [15, 8], [10, 12]] },
+  stage: { label: '무대', floor: 'wood', wall: 'curtain', P: { fa: '#b07c46', fb: '#8f5f31', wt: '#b02a34', wf: '#84202a', trim: GOLD },
+    props: [['s', 7, 4], ['s', 14, 5], ['s', 15, 5], ['s', 22, 4], ['s', 10, 8], ['s', 19, 8], ['S', 1, 2], ['S', 28, 2], ['S', 1, 9], ['S', 28, 9], ['l', 4, 2], ['l', 25, 2],
+      ['b', 5, 12], ['b', 6, 12], ['b', 9, 12], ['b', 10, 12], ['b', 19, 12], ['b', 20, 12], ['b', 23, 12], ['b', 24, 12], ['b', 5, 14], ['b', 6, 14], ['b', 23, 14], ['b', 24, 14], ['x', 13, 2], ['u', 16, 2]],
+    deco: [['N', 14, 0], ['N', 15, 0]],
+    spots: [[7, 5], [14, 6], [22, 5], [10, 9], [19, 9], [4, 8], [26, 7], [15, 10]] },
+  noir: { label: '한밤의 사무실', floor: 'dark', wall: 'night', P: { fa: '#2c3254', fb: '#222746', wt: '#1e2440', wf: '#161a2e', trim: '#0d1020', sky: '#0b1030' },
+    props: [['d', 4, 4], ['d', 5, 4], ['l', 6, 4], ['d', 11, 4], ['d', 12, 4], ['d', 18, 4], ['d', 19, 4], ['l', 17, 4], ['d', 24, 4], ['d', 25, 4], ['l', 26, 4],
+      ['f', 1, 2], ['f', 2, 2], ['f', 27, 2], ['f', 28, 2], ['x', 1, 8], ['x', 2, 8], ['x', 28, 9], ['k', 14, 2], ['d', 8, 10], ['d', 9, 10], ['l', 10, 10], ['d', 20, 10], ['d', 21, 10], ['l', 19, 10], ['p', 1, 14], ['p', 28, 14], ['v', 23, 14]],
+    deco: [['W', 4, 0], ['W', 5, 0], ['W', 9, 0], ['W', 10, 0], ['W', 19, 0], ['W', 20, 0], ['W', 24, 0], ['W', 25, 0], ['c', 14, 0]],
+    spots: [[8, 5], [15, 5], [22, 5], [5, 9], [13, 10], [24, 9], [17, 12], [10, 13]] },
+  feast: { label: '회식 자리', floor: 'wood', wall: 'brick', P: { fa: '#8a6238', fb: '#6f4c2a', wt: '#a2573f', wf: '#7c3f2e', trim: '#4a241a' },
+    props: [['g', 5, 5], ['g', 6, 5], ['b', 5, 4], ['b', 6, 4], ['b', 5, 6], ['b', 6, 6], ['g', 13, 5], ['g', 14, 5], ['b', 13, 4], ['b', 14, 4], ['b', 13, 6], ['b', 14, 6], ['g', 22, 5], ['g', 23, 5], ['b', 22, 4], ['b', 23, 4], ['b', 22, 6], ['b', 23, 6],
+      ['g', 9, 10], ['g', 10, 10], ['b', 9, 11], ['b', 10, 11], ['g', 18, 10], ['g', 19, 10], ['b', 18, 11], ['b', 19, 11], ['v', 1, 2], ['w', 28, 2], ['x', 27, 13], ['x', 28, 13], ['p', 1, 14], ['S', 28, 8]],
+    deco: [['N', 9, 0], ['N', 10, 0], ['h', 19, 0], ['c', 14, 0]],
+    spots: [[9, 5], [17, 5], [26, 5], [6, 9], [13, 9], [22, 9], [3, 12], [25, 12]] },
+  karaoke: { label: '노래방', floor: 'dark', wall: 'night', P: { fa: '#4a2f66', fb: '#3a2452', wt: '#2c1c44', wf: '#22143a', trim: '#140a24', sky: '#3a1050' },
+    props: [['S', 1, 2], ['S', 28, 2], ['v', 3, 2], ['T', 7, 5], ['T', 8, 5], ['b', 7, 4], ['b', 8, 4], ['b', 7, 6], ['b', 8, 6], ['T', 21, 5], ['T', 22, 5], ['b', 21, 4], ['b', 22, 4], ['b', 21, 6], ['b', 22, 6],
+      ['s', 14, 4], ['s', 15, 4], ['s', 14, 5], ['s', 15, 5], ['u', 13, 2], ['u', 16, 2], ['l', 11, 2], ['l', 18, 2], ['T', 10, 11], ['T', 11, 11], ['b', 10, 12], ['b', 11, 12], ['T', 18, 11], ['T', 19, 11], ['b', 18, 12], ['b', 19, 12], ['x', 1, 13], ['w', 28, 13], ['S', 1, 8], ['S', 28, 8]],
+    deco: [['N', 6, 0], ['N', 7, 0], ['N', 14, 0], ['N', 15, 0], ['N', 22, 0], ['N', 23, 0]],
+    spots: [[11, 5], [18, 5], [14, 7], [5, 9], [24, 9], [14, 11], [8, 13], [22, 13]] },
+  lobby: { label: '본사 복도', floor: 'marble', wall: 'office', P: { fa: '#dcd7cf', fb: '#c6c0b6', wt: '#ece4cc', wf: '#d2c9aa', trim: NAVY }, props: [], deco: [], spots: [] },
+};
+const SOLID_OK = new Set(['', 'm', 's']); // props you can walk over
+
+function buildRoom(themeKey) {
+  const th = THEMES[themeKey] || THEMES.office;
+  const wall = [], obj = [];
+  for (let r = 0; r < ROWS; r++) { wall.push([]); obj.push([]); for (let c = 0; c < COLS; c++) { wall[r].push(r <= 1 || r === ROWS - 1 || c === 0 || c === COLS - 1); obj[r].push(''); } }
+  for (const [ch, c, r] of th.props) obj[r][c] = ch;
+  for (const [ch, c, r] of th.deco) obj[r][c] = ch;
+  const doors = [{ c: 14, r: ROWS - 1, kind: 'exit' }, { c: 15, r: ROWS - 1, kind: 'exit' }];
+  return finishMap({ th, wall, obj, doors, spots: th.spots });
+}
+function hubDoorCol(i, n) { return 2 + i * Math.max(3, Math.floor(24 / n)); }
+function buildHub() {
+  const th = THEMES.lobby, n = QUIZ.episodes.length;
+  const wall = [], obj = [];
+  for (let r = 0; r < ROWS; r++) { wall.push([]); obj.push([]); for (let c = 0; c < COLS; c++) { wall[r].push(r <= 2 || r >= ROWS - 2 || c === 0 || c === COLS - 1); obj[r].push(''); } }
+  const doors = [];
+  for (let i = 0; i < n; i++) { const c = hubDoorCol(i, n); doors.push({ c, r: 2, kind: 'ep', ep: i }); if (c + 2 < 26 && hubDoorCol(i + 1, n) - c >= 4) obj[3][c + 2] = 'p'; }
+  doors.push({ c: 27, r: 2, kind: 'boss' });
+  for (let c = 3; c < 27; c += 4) { obj[ROWS - 2][c] = 'W'; obj[ROWS - 2][c + 1] = 'W'; }
+  [['b', 4, 12], ['b', 5, 12], ['w', 8, 13], ['k', 10, 13], ['d', 13, 9], ['d', 14, 9], ['n', 12, 9], ['d', 13, 11], ['d', 14, 11], ['n', 12, 11], ['d', 18, 9], ['d', 19, 9], ['n', 20, 9], ['d', 18, 11], ['d', 19, 11], ['n', 20, 11],
+    ['p', 1, 13], ['p', 28, 13], ['f', 23, 13], ['f', 24, 13], ['v', 26, 13], ['b', 16, 13], ['x', 1, 8]].forEach(([ch, c, r]) => { obj[r][c] = ch; });
+  obj[0][25] = 'P'; obj[0][26] = 'P';
+  return finishMap({ th, wall, obj, doors, spots: [] });
+}
+function finishMap(m) { // bake the still layer once
+  const cv = sheet(COLS * T, ROWS * T), g = cv.getContext('2d');
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (m.wall[r][c]) { drawWall(g, m.th.wall, m.th.P, c, r); if (m.obj[r][c]) drawDeco(g, m.obj[r][c], c, r, m.th.P); }
+    else drawFloor(g, m.th.floor, m.th.P, c, r);
+  }
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (!m.wall[r][c] && m.obj[r][c]) drawProp(g, m.obj[r][c], c, r);
+  m.layer = cv;
+  m.solid = (c, r) => c < 0 || r < 0 || c >= COLS || r >= ROWS || m.wall[r][c] || !SOLID_OK.has(m.obj[r][c]);
+  return m;
+}
+
+// ---- The game ---------------------------------------------------------------------------
+const SAVE_KEY = 'muhan-sangsa-daesawang';
+function loadSave() { try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch (e) { return {}; } }
+function writeSave() { try { localStorage.setItem(SAVE_KEY, JSON.stringify({ cleared: state.cleared, tries: state.tries, char: state.char })); } catch (e) { /* a private window: nothing kept */ } }
+const EPS = QUIZ.episodes;
+const norm = s => String(s).toLowerCase().replace(/[\s.,!?~…'"“”‘’\-·()]/g, '');
+function editDistance(a, b) {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[a.length][b.length];
+}
+function typedRight(q, given) {
+  const g = norm(given); if (!g) return false;
+  return [q.a, ...(q.alt || [])].some(c => { const n = norm(c); return g === n || (n.length >= 4 && editDistance(g, n) <= tune.typo_slack); });
+}
+const speakerName = q => q.name || (CHARS[q.who] || CHARS.guest).name;
+const speakerKey = q => (CHARS[q.who] ? q.who : 'guest');
+
+let scene, state, hubMap;
+function reset() {
+  seed = Number(params.get('seed')) || CONFIG.seed;
+  const saved = loadSave();
+  hubMap = buildHub();
+  state = {
+    t: 0, mode: 'hub', score: 0, gained: '', goal: false,
+    cleared: saved.cleared || {},            // episode id -> best score
+    tries: saved.tries || {},                // episode id -> how many times the room was entered
+    char: saved.char || null, cc: null,      // the player's character; cc is the character screen
+    map: hubMap, room: null, q: null, last: null, report: null,
+    p: { x: 3 * T + 8, y: 6 * T, face: 1, walk: 0, frame: 0 },
+    toast: null, near: null,
+  };
+  state.score = totalScore();
+  applyChar(state.char || DEFAULT_CHAR);
+}
+function totalScore() { const v = EPS.map(e => state.cleared[e.id] || 0); return Math.round(v.reduce((a, b) => a + b, 0) / Math.max(1, EPS.length)); }
+const unlocked = i => i === 0 || state.cleared[EPS[i - 1].id] != null;
+const allCleared = () => EPS.every(e => state.cleared[e.id] != null);
+const totalTries = () => EPS.reduce((a, e) => a + (state.tries[e.id] || 0), 0);
+const playerName = () => (state.char && state.char.name) || '신입사원';
+function openCreate() { state.cc = { row: 0, char: Object.assign({}, DEFAULT_CHAR, state.char || {}) }; scene = 'create'; }
+function toast(msg, secs = 3) { state.toast = { msg, t: secs }; }
+
+function startRoom(i) {
+  const ep = EPS[i], map = buildRoom(ep.theme);
+  const picked = shuffle(ep.questions.slice()).slice(0, tune.questions_per_room);
+  const npcs = [];
+  for (const q of picked) {
+    const who = speakerKey(q), key = who === 'guest' ? speakerName(q) : who; // one figure per person, never a clone
+    let n = npcs.find(v => v.key === key);
+    if (!n) { const s = map.spots[npcs.length % map.spots.length]; n = { key, who, name: who === 'guest' ? speakerName(q) : CHARS[who].name, x: s[0] * T + 8, y: s[1] * T + 14, queue: [], marks: [] }; npcs.push(n); }
+    n.queue.push(q);
+  }
+  state.map = map;
+  state.tries[ep.id] = (state.tries[ep.id] || 0) + 1; writeSave();
+  state.room = { ep: i, npcs, total: picked.length, asked: 0, correct: 0, log: [], attempt: state.tries[ep.id] };
+  state.p.x = 15 * T; state.p.y = 14 * T + 12; state.p.face = -1;
+  state.mode = 'intro'; state.t = 0; state.q = null; state.last = null; state.report = null;
+  events.push({ type: 'enter', ep: ep.id }); sfx.door();
+}
+function exitToHub(i, msg) {
+  state.map = hubMap; state.room = null; state.mode = 'hub';
+  state.p.x = hubDoorCol(i, EPS.length) * T + 8; state.p.y = 3 * T + 14; state.p.face = 1;
+  if (msg) toast(msg, 4);
+}
+function ask(npc) {
+  const r = state.room, q = npc.queue.shift();
+  const canChoose = q.wrong && q.wrong.length >= 3;
+  let typed;
+  if (q.t === 'c' && canChoose) typed = false; else if (q.t === 't' || !canChoose) typed = true;
+  else if (r.ep === 0 && r.asked === 0) typed = false;      // the first question is a choice
+  else if (r.ep === 0 && r.asked === 1) typed = true;       // the second is typed
+  else typed = rng() < tune.typed_ratio + r.ep * tune.typed_ramp;
+  const limit = typed ? tune.type_time : tune.choice_time;
+  state.q = { q, npc, typed, options: typed ? [] : shuffle([q.a, ...q.wrong.slice(0, 3)]), sel: 0, left: limit, limit };
+  state.mode = 'quiz'; r.asked++;
+  answerEl.value = ''; typedSubmit = null; submitAfterCompose = false;
+  sfx.talk();
+}
+function resolve(given, timeout) {
+  const Q = state.q, ok = !timeout && (Q.typed ? typedRight(Q.q, given) : given === Q.q.a);
+  const r = state.room;
+  if (ok) r.correct++;
+  Q.npc.marks.push(ok);
+  state.last = { q: Q.q, ok, given: timeout ? '' : given, timeout, typed: Q.typed };
+  r.log.push(state.last);
+  state.mode = 'reveal'; state.t = 0;
+  events.push({ type: 'answer', ok });
+  ok ? sfx.right() : sfx.wrong();
+}
+function finishRoom() {
+  const r = state.room, score = Math.round(100 * r.correct / r.total), pass = score > tune.pass_score;
+  state.report = { score, pass, wrong: r.log.filter(l => !l.ok), page: 0, pages: 1 };
+  state.mode = 'report';
+  pass ? sfx.clear() : sfx.fail();
+}
+function closeReport() {
+  const r = state.room, rep = state.report, ep = EPS[r.ep];
+  if (!rep.pass) { startRoom(r.ep); return; }
+  const first = state.cleared[ep.id] == null;
+  state.cleared[ep.id] = Math.max(state.cleared[ep.id] || 0, rep.score);
+  state.score = totalScore(); writeSave();
+  const done = allCleared();
+  exitToHub(r.ep, done ? '모든 회차 통과! 복도 끝 사장실로 가세요.' : first ? `${r.ep + 1}회차 통과! 다음 문이 열렸습니다.` : `${r.ep + 1}회차 다시 통과: ${rep.score}점`);
+  sfx.door();
+}
+
+function movePlayer(dt) {
+  const p = state.p, m = state.map;
+  let dx = (down.has('ArrowRight') || down.has('KeyD') ? 1 : 0) - (down.has('ArrowLeft') || down.has('KeyA') ? 1 : 0);
+  let dy = (down.has('ArrowDown') || down.has('KeyS') ? 1 : 0) - (down.has('ArrowUp') || down.has('KeyW') ? 1 : 0);
+  if (!dx && !dy) { p.frame = 0; p.walk = 0; return; }
+  const k = (dx && dy ? 0.7071 : 1) * tune.walk_speed * dt;
+  if (dx) p.face = dx;
+  const free = (x, y) => {
+    for (const [ox, oy] of [[-4, -5], [4, -5], [-4, 0], [4, 0]]) if (m.solid(Math.floor((x + ox) / T), Math.floor((y + oy) / T))) return false;
+    if (state.room) for (const n of state.room.npcs) if (Math.abs(n.x - x) < 11 && Math.abs(n.y - y) < 7) return false;
+    return true;
+  };
+  if (dx && free(p.x + dx * k, p.y)) p.x += dx * k;
+  if (dy && free(p.x, p.y + dy * k)) p.y += dy * k;
+  p.walk += dt; p.frame = 1 + (Math.floor(p.walk * 8) % 2);
+}
+function findNear() { // the nearest thing the player can act on
+  const p = state.p, range = tune.talk_range; let best = null, bd = range;
+  for (const d of state.map.doors) {
+    const dist = Math.hypot(d.c * T + 8 - p.x, d.r * T + 8 - (p.y - 3));
+    if (dist < bd) { bd = dist; best = { door: d }; }
+  }
+  if (state.room) for (const n of state.room.npcs) {
+    const dist = Math.hypot(n.x - p.x, n.y - p.y);
+    if (dist < bd && n.queue.length) { bd = dist; best = { npc: n }; }
+  }
+  return best;
+}
+function nearLabel(n) {
+  if (!n) return '';
+  if (n.npc) return `Space: ${n.npc.name}에게 말 걸기`;
+  const d = n.door;
+  if (d.kind === 'exit') return 'Space: 복도로 나가기 (이 방 진행은 사라집니다)';
+  if (d.kind === 'boss') return allCleared() ? 'Space: 사장실 들어가기' : '사장실: 모든 회차를 통과해야 열립니다';
+  const ep = EPS[d.ep], best = state.cleared[ep.id];
+  if (!unlocked(d.ep)) return `${d.ep + 1}회차 잠김: 앞 회차를 먼저 통과하세요`;
+  return `Space: ${d.ep + 1}회차 「${ep.title}」 입장${best != null ? ` (최고 ${best}점)` : ''}`;
+}
+function act(n) {
+  if (n.npc) { ask(n.npc); return; }
+  const d = n.door;
+  if (d.kind === 'exit') { exitToHub(state.room.ep); sfx.door(); }
+  else if (d.kind === 'boss') { if (allCleared()) { state.goal = true; state.gained = `대사왕 임명: 평균 ${state.score}점`; scene = 'results'; state.t = 0; sfx.clear(); } else sfx.locked(); }
+  else if (unlocked(d.ep)) startRoom(d.ep); else sfx.locked();
+}
+const confirmKey = () => pressed('Space') || pressed('Enter');
+
+const scenes = {
+  figures: {
+    update(dt) { state.t += dt; },
+    draw() {
+      clear('#dcd7cf'); text('무한상사 사람들', W / 2, 20, 14, INK, 'center', true);
+      const keys = Object.keys(CHARS);
+      keys.forEach((k, i) => {
+        const col = i % 6, row = Math.floor(i / 6), x = 60 + col * 72, y = 100 + row * 96;
+        box(x - 22, y - 44, 44, 52, '#c6c0b6'); drawPerson(k, x, y, 0); text(CHARS[k].name, x, y + 20, 9, INK, 'center', true);
+      });
+    },
+  },
+  title: {
+    update(dt) {
+      state.t += dt;
+      if (pressed('KeyR')) { try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* nothing kept */ } reset(); sfx.locked(); }
+      if (pressed('KeyC')) { openCreate(); sfx.move(); return; }
+      if (pressed('Enter') || pressed('Space')) {
+        if (!state.char) { openCreate(); sfx.move(); return; }
+        const t = state.t; reset(); state.t = t; scene = 'play'; sfx.door();
+      }
+    },
+    draw() {
+      clear(NAVY);
+      for (let c = 0; c < COLS; c++) for (let r = 12; r < 17; r++) drawFloor(ctx, 'marble', THEMES.lobby.P, c, r);
+      box(0, 190, W, 2, INK);
+      frameBox(110, 22, 260, 62, PAPER); box(114, 26, 252, 54, GOLD); box(117, 29, 246, 48, PAPER);
+      text(TITLE, W / 2, 46, 24, INK, 'center', true);
+      text('회차별 방에서 명대사의 빈칸을 채워라', W / 2, 68, 10, NAVY, 'center', true);
+      CONTROLS.forEach((c, i) => text(c, W / 2, 102 + i * 15, 10, '#e8ecf8'));
+      const cast = ['yu', 'park', 'junha', 'don', 'player', 'noh', 'haha', 'gil'];
+      cast.forEach((k, i) => drawPerson(k, 100 + i * 40, 232, k === 'player' ? 1 + (Math.floor(state.t * 6) % 2) : 0));
+      if (Math.floor(state.t * 2) % 2 === 0) text(state.char ? `Enter: ${playerName()} 출근하기` : 'Enter: 캐릭터 만들고 출근하기', W / 2, 168, 12, GOLD, 'center', true);
+      if (state.char) text('C: 캐릭터 다시 만들기', W / 2, 183, 9, '#e8ecf8');
+      const n = EPS.filter(e => state.cleared[e.id] != null).length;
+      text(n ? `이어서 하기: ${n}/${EPS.length} 회차 통과 · R: 처음부터` : `총 ${EPS.length}개 회차 · 80점 이하면 그 방을 다시 풉니다`, W / 2, 256, 9, INK);
+    },
+  },
+  create: {
+    update(dt) {
+      state.t += dt;
+      const cc = state.cc, c = cc.char, row = CC_ROWS[cc.row];
+      if (pressed('Escape')) { scene = 'title'; return; }
+      if (pressed('ArrowUp') || (pressed('KeyW') && cc.row)) { cc.row = Math.max(0, cc.row - 1); sfx.move(); return; }
+      if (pressed('ArrowDown') || (pressed('KeyS') && cc.row)) { cc.row = Math.min(CC_ROWS.length - 1, cc.row + 1); sfx.move(); return; }
+      if (row.k === 'go') {
+        if (confirmKey()) { c.name = (c.name || '').trim().slice(0, 8); state.char = c; state.cc = null; writeSave(); applyChar(c); const t = state.t; reset(); state.t = t; scene = 'play'; sfx.clear(); }
+        return;
+      }
+      if (row.k === 'name') return;
+      const dir = (pressed('ArrowRight') || pressed('KeyD') ? 1 : 0) - (pressed('ArrowLeft') || pressed('KeyA') ? 1 : 0);
+      if (dir) {
+        const opts = rowOpts(row, c), i = Math.max(0, opts.findIndex(o => o[0] === c[row.k]));
+        c[row.k] = opts[(i + dir + opts.length) % opts.length][0];
+        if (row.k === 'gender') { // a new list of hair, and the usual legs
+          const hairs = rowOpts(CC_ROWS[2], c); if (!hairs.some(h => h[0] === c.hair)) c.hair = hairs[0][0];
+          c.legs = c.gender === 'f' ? 'skirt' : 'pants';
+        }
+        applyChar(c); sfx.move();
+      } else if (confirmKey()) { cc.row++; sfx.move(); }
+    },
+    draw() {
+      const cc = state.cc, c = cc.char;
+      clear(NAVY);
+      text('사원증 만들기', W / 2, 16, 14, '#ffffff', 'center', true);
+      // the ID card with the character on it
+      frameBox(22, 34, 124, 196, PAPER); box(23, 35, 122, 16, ORANGE); text('무한상사 사원증', 84, 43.5, 9, '#ffffff', 'center', true);
+      box(40, 58, 88, 128, '#dcd7cf');
+      const s = SPR.player[1 + (Math.floor(state.t * 4) % 2)];
+      ctx.drawImage(s, 84 - 36, 182 - s.foot * 4, PGW * 4, PGH * 4); // the mirror: the same sprite, four times the size
+      text(c.name || '신입사원', 84, 200, 12, INK, 'center', true);
+      text(c.gender === 'f' ? '영업 3팀 · 여' : '영업 3팀 · 남', 84, 216, 9, NAVY);
+      drawPerson('player', 160, 226, 0);
+      // the parts
+      CC_ROWS.forEach((row, i) => {
+        const y = 36 + i * 15.5, on = i === cc.row;
+        if (row.k === 'go') { frameBox(176, y + 3, 280, 18, on ? GOLD : '#8a8f9c'); text(on ? 'Enter: 이 모습으로 입장하기' : '입장하기', 316, y + 12.5, 11, INK, 'center', true); return; }
+        frameBox(176, y, 280, 15, on ? '#ffe9b0' : PAPER, on ? ORANGE : INK);
+        text(row.label, 184, y + 8, 9, NAVY, 'left', true);
+        if (row.k === 'name') return; // the name box sits on this row
+        const opts = rowOpts(row, c), sel = Math.max(0, opts.findIndex(o => o[0] === c[row.k]));
+        if (row.colors) opts.forEach((o, j) => {
+          const x = 337 - opts.length * 7 + j * 14;
+          if (j === sel) box(x - 1, y + 1, 13, 13, INK);
+          box(x + 1, y + 3, 9, 9, INK); box(x + 2, y + 4, 7, 7, o[0]);
+        });
+        else text(opts[sel][1], 337, y + 8, 10, INK, 'center', on);
+        if (on) { // arrows, drawn
+          ctx.fillStyle = ORANGE;
+          for (let k = 0; k < 4; k++) { ctx.fillRect(250 + k, y + 7 - k, 1, 1 + k * 2); ctx.fillRect(427 - k, y + 7 - k, 1, 1 + k * 2); }
+        }
+      });
+      text('위아래: 항목 고르기 · 좌우: 바꾸기 · Enter: 다음 · Esc: 처음 화면', W / 2, 258, 9, '#e8ecf8');
+    },
+  },
+  play: {
+    update(dt) {
+      if (pressed('Escape') || (pressed('KeyP') && state.mode !== 'quiz')) { scene = 'pause'; return; }
+      state.t += dt;
+      if (state.toast && (state.toast.t -= dt) <= 0) state.toast = null;
+      const m = state.mode;
+      if (m === 'hub' || m === 'room') {
+        movePlayer(dt);
+        state.near = findNear();
+        if (state.near && confirmKey()) act(state.near);
+      } else if (m === 'intro') {
+        if (state.t > tune.intro_time || (state.t > 0.3 && confirmKey())) { state.mode = 'room'; state.t = 0; }
+      } else if (m === 'quiz') {
+        const Q = state.q, before = Math.ceil(Q.left);
+        Q.left -= dt;
+        if (Q.left <= 5 && Math.ceil(Q.left) !== before && Q.left > 0) sfx.tick();
+        if (Q.left <= 0) { resolve('', true); return; }
+        if (Q.typed) {
+          if (typedSubmit != null) { const v = typedSubmit; typedSubmit = null; if (v.trim()) resolve(v.trim(), false); }
+        } else {
+          if (pressed('ArrowUp') || pressed('KeyW')) { Q.sel = (Q.sel + 3) % 4; sfx.move(); }
+          if (pressed('ArrowDown') || pressed('KeyS')) { Q.sel = (Q.sel + 1) % 4; sfx.move(); }
+          for (let i = 0; i < 4; i++) if (pressed('Digit' + (i + 1)) || pressed('Numpad' + (i + 1))) { resolve(Q.options[i], false); return; }
+          if (confirmKey()) resolve(Q.options[Q.sel], false);
+        }
+      } else if (m === 'reveal') {
+        if (state.t > 0.25 && confirmKey()) {
+          if (state.room.asked >= state.room.total) finishRoom(); else { state.mode = 'room'; state.q = null; }
+        }
+      } else if (m === 'report') {
+        if (confirmKey()) { const rep = state.report; if (rep.page < rep.pages - 1) { rep.page++; sfx.move(); } else closeReport(); }
+      }
+    },
+    draw() {
+      drawWorld();
+      const m = state.mode;
+      if (m === 'intro') drawIntro();
+      else if (m === 'quiz' || m === 'reveal') drawQuiz();
+      else if (m === 'report') drawReport();
+    },
+  },
+  pause: {
+    update() { if (pressed('KeyP') || pressed('Escape') || pressed('Enter')) scene = 'play'; },
+    draw() {
+      drawWorld(); box(0, 0, W, H, 'rgba(10,12,30,0.7)');
+      frameBox(150, 95, 180, 80, PAPER); text('일시정지', W / 2, 120, 16, INK, 'center', true);
+      text('Esc 또는 Enter: 계속하기', W / 2, 146, 10, NAVY); text(muted ? 'M: 소리 켜기' : 'M: 소리 끄기', W / 2, 161, 10, NAVY);
+    },
+  },
+  results: {
+    update(dt) { state.t += dt; if (state.t > 0.5 && pressed('Enter')) { reset(); scene = 'title'; } },
+    draw() {
+      clear(NAVY);
+      frameBox(70, 20, 340, 230, PAPER); box(76, 26, 328, 218, GOLD); box(80, 30, 320, 210, PAPER);
+      text('사 령 장', W / 2, 54, 20, INK, 'center', true);
+      text(`${playerName()} 귀하`, W / 2, 80, 11, NAVY, 'center', true);
+      text('위 사람은 무한상사의 모든 회차 대사를 통과하였으므로', W / 2, 100, 10, INK);
+      text('이에 「대사왕」으로 임명함.', W / 2, 115, 10, INK);
+      EPS.forEach((e, i) => text(`${i + 1}회차 ${e.title}: ${state.cleared[e.id] || 0}점 (시도 ${state.tries[e.id] || 0}회)`, W / 2, 136 + i * 13, 9, NAVY));
+      const y = 136 + EPS.length * 13 + 8;
+      text(`평균 ${state.score}점`, W / 2, y + 4, 14, RED, 'center', true);
+      drawPerson('boss', 120, 226, 0); drawPerson('player', 360, 226, 1 + (Math.floor(state.t * 6) % 2));
+      text('Enter: 처음 화면으로', W / 2, 228, 10, INK, 'center', true);
+    },
+  },
+};
+
+// ---- Drawing the play scene ---------------------------------------------------------------
+function drawMark(x, y, ok) { // a tick or a cross, in pixels
+  frameBox(x - 5, y - 5, 10, 10, ok ? GREEN : RED);
+  ctx.fillStyle = '#ffffff';
+  if (ok) [[-3, 0], [-2, 1], [-1, 2], [0, 1], [1, 0], [2, -1], [3, -2]].forEach(([a, b]) => ctx.fillRect(x + a, y + b, 1, 2));
+  else for (let i = -3; i <= 2; i++) { ctx.fillRect(x + i, y + i, 2, 1); ctx.fillRect(x + i, y - i - 1, 2, 1); }
+}
+function drawPaperIcon(x, y, n) { // the paper above a boss who still has a question
+  frameBox(x - 5, y - 6, 10, 12, PAPER); box(x - 3, y - 3, 6, 1, NAVY); box(x - 3, y - 1, 6, 1, NAVY); box(x - 3, y + 1, 4, 1, NAVY);
+  if (n > 1) { frameBox(x + 3, y - 9, 9, 9, ORANGE); text(String(n), x + 7.5, y - 4, 8, '#ffffff', 'center', true); }
+}
+function drawWorld() {
+  clear(INK);
+  const m = state.map, p = state.p, oy = HUD;
+  ctx.drawImage(m.layer, 0, oy);
+  for (const d of m.doors) { // doors and their signs
+    const x = d.c * T, y = d.r * T + oy;
+    if (d.kind === 'exit') { drawDoor(ctx, x, y, '#7a5230'); continue; }
+    if (d.kind === 'boss') {
+      drawDoor(ctx, x, y, allCleared() ? GOLD : '#5a4a6a'); frameBox(x - 8, y - 26, 32, 13, allCleared() ? GOLD : '#8a8f9c'); text('사장실', x + 8, y - 19, 8, INK, 'center', true); continue;
+    }
+    const done = state.cleared[EPS[d.ep].id] != null, open = unlocked(d.ep);
+    drawDoor(ctx, x, y, done ? '#3f8a5a' : open ? '#c4803a' : '#6c7586');
+    frameBox(x - 4, y - 26, 24, 13, done ? '#bfe8c8' : open ? PAPER : '#aab0bc'); text(`${d.ep + 1}회차`, x + 8, y - 19, 8, INK, 'center', true);
+    box(x + 6, y - 11, 4, 4, INK); box(x + 7, y - 10, 2, 2, done ? '#5af08a' : open ? '#ffd860' : '#c8343a'); // the lamp
+    if (!open) { box(x + 5, y + 7, 6, 5, INK); box(x + 6, y + 5, 4, 2, INK); box(x + 7, y + 6, 2, 1, '#6c7586'); box(x + 7, y + 9, 2, 1, GOLD); } // a padlock
+  }
+  const list = [{ y: p.y, draw: () => drawPerson('player', p.x, p.y + oy, p.frame) }];
+  if (state.room) for (const n of state.room.npcs) list.push({ y: n.y, draw: () => {
+    const bob = n.queue.length && Math.floor(state.t * 2 + n.x) % 2 ? 1 : 0;
+    drawPerson(n.who, n.x, n.y + oy, 0);
+    const top = n.y + oy - 34;
+    if (n.queue.length) drawPaperIcon(n.x, top - bob, n.queue.length);
+    else n.marks.forEach((ok, i) => drawMark(n.x - (n.marks.length - 1) * 6 + i * 12, top + 2, ok));
+  } });
+  list.sort((a, b) => a.y - b.y).forEach(e => e.draw());
+  // HUD strip
+  box(0, 0, W, HUD, INK);
+  if (state.room) {
+    const r = state.room, ep = EPS[r.ep];
+    text(`${r.ep + 1}회차 · ${ep.title}`, 6, 7.5, 9, '#ffffff', 'left', true);
+    text(`시도 ${r.attempt}회 · 문제 ${r.asked}/${r.total} · 정답 ${r.correct}`, W - 6, 7.5, 9, '#ffd860', 'right', true);
+  } else {
+    text(`무한상사 본사 복도 · ${playerName()}`, 6, 7.5, 9, '#ffffff', 'left', true);
+    text(`총 시도 ${totalTries()}회 · 통과 ${EPS.filter(e => state.cleared[e.id] != null).length}/${EPS.length} 회차 · 평균 ${state.score}점${muted ? ' · 음소거' : ''}`, W - 6, 7.5, 9, '#ffd860', 'right', true);
+  }
+  if (state.mode === 'hub' || state.mode === 'room') {
+    const label = nearLabel(state.near);
+    if (label) { ctx.font = fontOf(10, true); const w = ctx.measureText(label).width + 16; frameBox(Math.round(W / 2 - w / 2), H - 22, Math.round(w), 17, PAPER); text(label, W / 2, H - 13, 10, INK, 'center', true); }
+    else if (state.toast) { ctx.font = fontOf(10, true); const w = ctx.measureText(state.toast.msg).width + 16; frameBox(Math.round(W / 2 - w / 2), H - 22, Math.round(w), 17, GOLD); text(state.toast.msg, W / 2, H - 13, 10, INK, 'center', true); }
+    else if (state.mode === 'hub' && state.t < 6 && !Object.keys(state.cleared).length) { frameBox(120, H - 22, 240, 17, PAPER); text('방향키로 걸어서 불 켜진 문 앞에서 Space', W / 2, H - 13, 10, INK, 'center', true); }
+    else if (state.mode === 'room' && state.room.asked === 0) { frameBox(110, H - 22, 260, 17, PAPER); text('서류를 든 상사에게 다가가 Space로 말을 거세요', W / 2, H - 13, 10, INK, 'center', true); }
+  }
+}
+function drawIntro() { // the motto frame flashes as you walk in
+  const ep = EPS[state.room.ep], t = state.t, flash = t < 0.5 && Math.floor(t * 12) % 2 === 0;
+  box(0, 0, W, H, 'rgba(10,12,30,0.72)');
+  frameBox(90, 70, 300, 120, flash ? '#ffffff' : GOLD); box(96, 76, 288, 108, flash ? '#fff4c0' : PAPER);
+  text('무한~ 상사!', W / 2, 96, 12, RED, 'center', true);
+  text(`${state.room.ep + 1}회차`, W / 2, 116, 11, NAVY, 'center', true);
+  text(ep.title, W / 2, 136, 17, INK, 'center', true);
+  const lines = layout([[ep.intro || '', NAVY]], 260, 9, false);
+  drawLines(lines.slice(0, 2), W / 2 - 130, 158, 9, false, 12);
+  text(ep.aired || '', W - 100, 84, 8, '#6c7586', 'right');
+}
+const PANEL = { x: 36, y: 20, w: 408, h: 238 };
+function drawPanel(title) {
+  box(0, 0, W, H, 'rgba(10,12,30,0.6)');
+  frameBox(PANEL.x, PANEL.y, PANEL.w, PANEL.h, PAPER);
+  box(PANEL.x + 1, PANEL.y + 1, PANEL.w - 2, 16, NAVY); text(title, PANEL.x + 8, PANEL.y + 9.5, 10, '#ffffff', 'left', true);
+  // approval boxes, like a form that goes up for sign-off
+  for (let i = 0; i < 3; i++) { frameBox(PANEL.x + PANEL.w - 26 - i * 22, PANEL.y + 20, 23, 22, PAPER); text(['부장', '차장', '담당'][i], PANEL.x + PANEL.w - 14.5 - i * 22, PANEL.y + 26, 8, '#6c7586'); }
+}
+function drawStamp(x, y, label, col) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(-0.2);
+  ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.strokeRect(-24, -13, 48, 26); ctx.lineWidth = 1; ctx.strokeRect(-21, -10, 42, 20);
+  text(label, 0, 0.5, 14, col, 'center', true); ctx.restore();
+}
+function quoteSegs(q, fill, col) { return [['"' + q.pre, INK], [fill, col], [q.post + '"', INK]]; }
+function drawQuiz() {
+  const Q = state.q, q = Q.q, r = state.room, reveal = state.mode === 'reveal', L = state.last;
+  drawPanel(`결재 서류 · ${r.ep + 1}회차 ${r.asked}/${r.total}번 · ${Q.typed ? '주관식' : '객관식'}`);
+  const px = PANEL.x, py = PANEL.y;
+  frameBox(px + 10, py + 22, 36, 42, '#dcd7cf'); drawPerson(Q.npc.who, px + 28, py + 60, 0);
+  text(speakerName(q), px + 54, py + 30, 11, NAVY, 'left', true);
+  drawLines(layout([[q.ctx || '', '#4a4e60']], 268, 9, false).slice(0, 2), px + 54, py + 45, 9, false, 12);
+  // the line
+  box(px + 10, py + 70, PANEL.w - 20, 1, '#c6c0b6');
+  const core = Q.typed ? '□'.repeat(Math.max(1, norm(q.a).length)) : '( ? )';
+  const blank = (q.pre && !q.pre.endsWith(' ') ? ' ' : '') + core + (q.post && !q.post.startsWith(' ') ? ' ' : '');
+  const segs = reveal ? quoteSegs(q, q.a, L.ok ? GREEN : RED) : quoteSegs(q, blank, ORANGE);
+  const lines = layout(segs, PANEL.w - 32, 13, true);
+  drawLines(lines.slice(0, 4), px + 16, py + 86, 13, true, 17);
+  const oy = py + 146;
+  if (!reveal) {
+    if (Q.typed) {
+      text('빈칸에 들어갈 말을 한글로 입력하고 Enter', W / 2, oy + 2, 10, NAVY, 'center', true);
+      frameBox(ANSWER_BOX.x - 2, ANSWER_BOX.y - 2, ANSWER_BOX.w + 4, ANSWER_BOX.h + 4, '#ffffff', ORANGE);
+      text(`${norm(q.a).length}글자 (띄어쓰기와 문장부호는 빼고 셉니다)`, W / 2, ANSWER_BOX.y + ANSWER_BOX.h + 12, 9, '#4a4e60');
+    } else Q.options.forEach((o, i) => {
+      const y = oy - 8 + i * 18, on = i === Q.sel;
+      frameBox(px + 14, y, PANEL.w - 28, 16, on ? '#ffe9b0' : '#ffffff', on ? ORANGE : '#8a8f9c');
+      frameBox(px + 16, y + 2, 12, 12, on ? ORANGE : NAVY); text(String(i + 1), px + 22, y + 8.5, 9, '#ffffff', 'center', true);
+      text(o, px + 34, y + 8.5, 11, INK, 'left', on);
+    });
+    // the clock
+    const f = Math.max(0, Q.left / Q.limit), by = py + PANEL.h - 16;
+    frameBox(px + 14, by, PANEL.w - 80, 8, '#ffffff'); box(px + 15, by + 1, Math.round((PANEL.w - 82) * f), 6, f > 0.35 ? GREEN : RED);
+    text(`${Math.ceil(Q.left)}초`, px + PANEL.w - 16, by + 4.5, 10, f > 0.35 ? INK : RED, 'right', true);
+  } else {
+    drawStamp(px + PANEL.w - 60, oy + 26, L.ok ? '정답' : '오답', L.ok ? GREEN : RED);
+    const mine = L.timeout ? '시간 초과' : L.given;
+    text(L.ok ? '정확합니다!' : `내 답: ${mine}`, px + 16, oy + 6, 11, L.ok ? GREEN : RED, 'left', true);
+    text(`정답: ${q.a}`, px + 16, oy + 24, 11, INK, 'left', true);
+    if (q.note) drawLines(layout([[q.note, '#4a4e60']], PANEL.w - 130, 9, false).slice(0, 2), px + 16, oy + 42, 9, false, 12);
+    text(state.room.asked >= state.room.total ? 'Space: 결과 보고서 보기' : 'Space: 계속', W / 2, py + PANEL.h - 12, 10, NAVY, 'center', true);
+  }
+}
+function drawReport() {
+  const rep = state.report, r = state.room, ep = EPS[r.ep];
+  drawPanel(`결과 보고서 · ${r.ep + 1}회차 ${ep.title}`);
+  const px = PANEL.x, py = PANEL.y;
+  text(`${rep.score}점`, px + 16, py + 34, 22, rep.pass ? GREEN : RED, 'left', true);
+  text(`${r.attempt}번째 시도 · ${r.total}문제 중 ${r.correct}개 정답`, px + 90, py + 30, 10, INK, 'left', true);
+  text(rep.pass ? '통과했습니다. 다음 회차 문이 열립니다.' : `${tune.pass_score}점 이하입니다. 이 방을 다시 풉니다.`, px + 90, py + 44, 10, rep.pass ? GREEN : RED, 'left', true);
+  drawStamp(px + PANEL.w - 112, py + 37, rep.pass ? '통과' : '반려', rep.pass ? GREEN : RED);
+  box(px + 10, py + 56, PANEL.w - 20, 1, '#c6c0b6');
+  const top = py + 68, bottom = py + PANEL.h - 22;
+  if (!rep.wrong.length) text('틀린 문제가 없습니다. 전부 정답!', W / 2, top + 40, 12, GREEN, 'center', true);
+  else {
+    // lay the wrong answers out page by page
+    const blocks = rep.wrong.map(l => ({ l, lines: layout([[`${speakerName(l.q)}: `, NAVY], ...quoteSegs(l.q, l.q.a, GREEN)], PANEL.w - 36, 10, true) }));
+    const pages = [[]]; let y = top;
+    for (const b of blocks) { const hgt = b.lines.length * 13 + 16; if (y + hgt > bottom && pages[pages.length - 1].length) { pages.push([]); y = top; } pages[pages.length - 1].push(b); y += hgt; }
+    rep.pages = pages.length; y = top;
+    text(`틀린 문제 ${rep.wrong.length}개${pages.length > 1 ? ` (${rep.page + 1}/${pages.length}쪽)` : ''}`, px + PANEL.w - 16, py + PANEL.h - 12, 9, '#4a4e60', 'right');
+    for (const b of pages[Math.min(rep.page, pages.length - 1)]) {
+      drawMark(px + 20, y + 1, false);
+      y = drawLines(b.lines, px + 30, y, 10, true, 13);
+      text(`내 답: ${b.l.timeout ? '시간 초과' : b.l.given}`, px + 30, y, 9, RED, 'left'); y += 16;
+    }
+  }
+  const more = rep.page < rep.pages - 1;
+  text(more ? 'Space: 다음 쪽' : rep.pass ? 'Space: 복도로 나가기' : 'Space: 다시 풀기', W / 2, py + PANEL.h - 12, 10, NAVY, 'center', true);
+}
+
+// ---- Loop: fixed step, frame time clamped ---------------------------------------------
+function step() {
+  if (pressed('KeyM') && !typing) { setMuted(!muted); hit.delete('KeyM'); }
+  scenes[scene].update(STEP); hit.clear();
+}
+let last, acc = 0, ALPHA = 1;
+function tick() {
+  const now = clock.now();
+  acc += Math.min(now - last, 0.25); last = now; // a stall never fast-forwards the game
+  while (acc >= STEP) { step(); acc -= STEP; }
+  ALPHA = acc / STEP;
+  drawFrame();
+}
+function drawFrame() { scenes[scene].draw(); syncAnswer(); syncName(); }
+function frame() { tick(); requestAnimationFrame(frame); }
+function timer() { if (document.visibilityState === 'visible' && clock.now() - last > 0.1) tick(); }
+
+// ---- What a check can read and drive (?manual=1 stops the loop; players never see it) ----
+window.game = {
+  get scene() { return scene; },
+  get state() { return state; },
+  press(code) { hit.add(code); },
+  hold(code, on) { on ? down.add(code) : down.delete(code); },
+  get events() { return events; },
+  step(n = 1, draw = true, alpha = 1) {
+    for (let i = 0; i < n; i++) step();
+    if (draw) { ALPHA = alpha; drawFrame(); }
+  },
+};
+
+reset();
+scene = params.get('scene') || 'title';
+addEventListener('resize', fit); fit();
+last = clock.now();
+if (params.get('manual') === '1') drawFrame();
+else { requestAnimationFrame(frame); setInterval(timer, 50); }
+</script>
+</body>
+</html>
